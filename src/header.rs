@@ -2,7 +2,7 @@
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc::{crc32, Hasher32};
-use std::fmt;
+use std::{cmp, fmt};
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -44,12 +44,14 @@ pub struct Header {
 }
 
 impl Header {
-    pub(crate) fn compute_new(
+    pub fn compute_new(
         primary: bool,
         pp: &[partition::Partition],
         guid: uuid::Uuid,
         backup_offset: u64,
+        part_table_lba: u64,
     ) -> Result<Self> {
+        let num_pp = cmp::max(pp.len() as u32, 128);
         let (cur, bak) = if primary {
             (1, backup_offset)
         } else {
@@ -71,8 +73,8 @@ impl Header {
             first_usable: first,
             last_usable: last,
             disk_guid: guid,
-            part_start: 2,
-            num_parts: pp.len() as u32,
+            part_start: part_table_lba,
+            num_parts: num_pp,
             part_size: 128,
             crc32_parts: 0,
         };
@@ -213,6 +215,7 @@ pub(crate) fn read_primary_header(
     file: &mut File,
     sector_size: disk::LogicalBlockSize,
 ) -> Result<Header> {
+    trace!("reading primary header");
     let cur = file.seek(SeekFrom::Current(0)).unwrap_or(0);
     let offset: u64 = sector_size.into();
     let res = file_read_header(file, offset);
@@ -224,6 +227,7 @@ pub(crate) fn read_backup_header(
     file: &mut File,
     sector_size: disk::LogicalBlockSize,
 ) -> Result<Header> {
+    trace!("reading backup header");
     let cur = file.seek(SeekFrom::Current(0)).unwrap_or(0);
     let h2sect = find_backup_lba(file, sector_size)?;
     let offset = h2sect
@@ -355,8 +359,7 @@ pub fn write_header(
         }
     };
 
-    let hdr = Header::compute_new(true, &[], guid, bak)?;
-    debug!("new header: {:#?}", hdr);
+    let hdr = Header::compute_new(true, &[], guid, bak, 2)?;
     hdr.write_primary(&mut file, sector_size)?;
 
     Ok(guid)

@@ -5,7 +5,7 @@
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc::crc32;
-use std::fmt;
+use std::{cmp, fmt, fs};
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -161,7 +161,6 @@ impl fmt::Display for Partition {
 }
 
 fn read_part_name(rdr: &mut Cursor<&[u8]>) -> Result<String> {
-    trace!("Reading partition name");
     let mut namebytes: Vec<u16> = Vec::new();
     for _ in 0..36 {
         let b = rdr.read_u16::<LittleEndian>()?;
@@ -175,7 +174,7 @@ fn read_part_name(rdr: &mut Cursor<&[u8]>) -> Result<String> {
 
 fn parse_parttype_guid(u: uuid::Uuid) -> PartitionType {
     let s = u.hyphenated().to_string().to_uppercase();
-    debug!("looking up partition type, GUID {}", s);
+    trace!("looking up known type for GUID {}", s);
     match PART_HASHMAP.get(&s) {
         Some(part_id) => PartitionType {
             guid: u,
@@ -227,12 +226,25 @@ pub(crate) fn file_read_partitions(
         .part_start
         .checked_mul(lb_size.into())
         .ok_or_else(|| Error::new(ErrorKind::Other, "partition overflow - start offset"))?;
-    trace!("seeking to partitions start: {:#x}", pstart);
+    trace!("checking CRC32 of partition table at {:#x}", pstart);
+    let _ = file.seek(SeekFrom::Start(pstart))?;
+    let pt_len = u64::from(header.num_parts)
+        .checked_mul(header.part_size.into())
+        .ok_or_else(|| Error::new(ErrorKind::Other, "partitions - size"))?;
+    let mut table = vec![0; pt_len as usize];
+    file.read_exact(&mut table)?;
+    let comp_crc = crc32::checksum_ieee(&table);
+    if comp_crc != header.crc32_parts {
+        return Err(Error::new(ErrorKind::Other, "partition table CRC mismatch"));
+    }
+
+    trace!(
+        "found partition table with valid CRC32, scanning {} partitions",
+        header.num_parts
+    );
     let _ = file.seek(SeekFrom::Start(pstart))?;
     let mut parts: Vec<Partition> = Vec::new();
-
-    trace!("scanning {} partitions", header.num_parts);
-    for _ in 0..header.num_parts {
+    for i in 0..header.num_parts {
         let mut bytes: [u8; 56] = [0; 56];
         let mut nameraw: [u8; 72] = [0; 72];
 
@@ -247,6 +259,7 @@ pub(crate) fn file_read_partitions(
             continue;
         }
 
+        trace!("reading name for partition #{}", i);
         let partname = read_part_name(&mut Cursor::new(&nameraw[..]))?;
         let p: Partition = Partition {
             part_type_guid: parse_parttype_guid(type_guid),
@@ -257,25 +270,59 @@ pub(crate) fn file_read_partitions(
             name: partname.to_string(),
         };
 
+        debug!(
+            "found valid partition #{} (out of {}), name '{}', type {}",
+            i, header.num_parts, partname, type_guid,
+        );
         parts.push(p);
-    }
-
-    debug!("checking partition table CRC");
-    let _ = file.seek(SeekFrom::Start(pstart))?;
-    let pt_len = u64::from(header.num_parts)
-        .checked_mul(header.part_size.into())
-        .ok_or_else(|| Error::new(ErrorKind::Other, "partitions - size"))?;
-    let mut table = vec![0; pt_len as usize];
-    file.read_exact(&mut table)?;
-
-    let comp_crc = crc32::checksum_ieee(&table);
-    if comp_crc != header.crc32_parts {
-        return Err(Error::new(ErrorKind::Other, "partition table CRC mismatch"));
     }
 
     Ok(parts)
 }
 
+pub fn write_partitions(
+    file: &mut fs::File,
+    table_lba: u64,
+    entry_size: u16,
+    pp: &[Partition],
+    lb_size: disk::LogicalBlockSize,
+) -> Result<()> {
+    if entry_size != 128 {
+        return Err(Error::new(
+            ErrorKind::Other,
+            "unsupported partition entry size",
+        ));
+    }
+
+    let num_pp = cmp::max(pp.len(), 128);
+    let pstart = table_lba
+        .checked_mul(lb_size.into())
+        .ok_or_else(|| Error::new(ErrorKind::Other, "partition overflow - table start"))?;
+
+    for i in 0..num_pp {
+        let prel = (i as u64).checked_mul(entry_size.into()).ok_or_else(|| {
+            Error::new(
+                ErrorKind::Other,
+                "partition entry overflow - relative offset",
+            )
+        })?;
+        let poff = pstart.checked_add(prel).ok_or_else(|| {
+            Error::new(ErrorKind::Other, "partition entry overflow - start offset")
+        })?;
+        let _ = file.seek(SeekFrom::Start(poff))?;
+        let bb = match pp.get(i) {
+            Some(p) => {
+                debug!("writing partition entry #{} at {:#x}", i, poff);
+                p.as_bytes(entry_size)?
+            }
+            None => vec![0u8; entry_size.into()],
+        };
+        file.write_all(&bb)?;
+    }
+
+    file.sync_all()?;
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use disk;

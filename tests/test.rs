@@ -1,13 +1,11 @@
 extern crate gpt;
 extern crate log;
-extern crate simplelog;
 extern crate tempfile;
 extern crate uuid;
 
 use gpt::disk;
 use gpt::header::{read_header, write_header, Header};
 use gpt::partition::{read_partitions, Partition, PartitionType};
-use simplelog::{Config, SimpleLogger};
 use std::io::Write;
 use std::path::Path;
 use std::str::FromStr;
@@ -58,7 +56,6 @@ fn test_read_header() {
 
 #[test]
 fn test_write_header() {
-    let _ = SimpleLogger::init(simplelog::LevelFilter::Trace, Config::default());
     let mut tempdisk = NamedTempFile::new().expect("failed to create tempfile disk");
     {
         let data: [u8; 4096] = [0; 4096];
